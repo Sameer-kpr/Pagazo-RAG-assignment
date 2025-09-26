@@ -1,0 +1,178 @@
+    import fetch from "node-fetch";
+    import pdfParse from "pdf-parse";
+    import { Pool } from "pg";
+    import { v4 as uuidv4 } from "uuid";
+    import OpenAI from "openai";
+    import express from "express";
+    import path from "path";
+    
+    const __dirname = path.resolve();
+    
+    const OPENAI_API_KEY = "sk-proj-82gT0PX8PWqnugWMeB4FYLmv5fl1wvW_sJiHx3qV5QIAOSIJw8DyWtoZxfPHyr_1budB8vov9T3BlbkFJyNwah6TmWUgBBnFQBpk0H5tma9JOV5IeZJ7PT_Zv7eXHHRVeBubscuQOE2asOGdI7CRFe7HOgA";
+    const DATABASE_URL = "postgresql://postgres:Sonakpr%40123@localhost:5432/mastra_rag_db";
+    const EMBEDDING_MODEL = "text-embedding-3-large";
+    const CHAT_MODEL = "gpt-4o";
+    
+    const pool = new Pool({ connectionString: DATABASE_URL });
+    const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+    
+    // ====== HELPERS ======
+    function chunkText(text, chunkSize = 1200, overlap = 200) {
+      const chunks = [];
+      let start = 0;
+      while (start < text.length) {
+        const end = Math.min(start + chunkSize, text.length);
+        const chunk = text.slice(start, end).trim();
+        if (chunk.length > 0) chunks.push(chunk);
+        if (end === text.length) break;
+        start = Math.max(0, end - overlap);
+      }
+      return chunks;
+    }
+    
+    async function ensureSchema() {
+      const client = await pool.connect();
+      try {
+        await client.query(`CREATE EXTENSION IF NOT EXISTS vector;`);
+        await client.query(`
+          CREATE TABLE IF NOT EXISTS documents (
+            id UUID PRIMARY KEY,
+            content TEXT,
+            metadata JSONB,
+            embedding vector(1536)
+          );
+        `);
+        await client.query(`
+          CREATE INDEX IF NOT EXISTS idx_documents_embedding
+          ON documents USING ivfflat (embedding) WITH (lists = 100);
+        `);
+      } finally {
+        client.release();
+      }
+    }
+    
+    async function createEmbedding(text) {
+      const resp = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: text });
+      return resp.data[0].embedding;
+    }
+    
+    async function upsertDocument(id, content, metadata, embedding) {
+      const client = await pool.connect();
+      try {
+        await client.query(
+          `INSERT INTO documents(id, content, metadata, embedding)
+           VALUES ($1, $2, $3, $4)
+           ON CONFLICT (id) DO UPDATE
+           SET content = EXCLUDED.content,
+               metadata = EXCLUDED.metadata,
+               embedding = EXCLUDED.embedding`,
+          [id, content, metadata, embedding]
+        );
+      } finally {
+        client.release();
+      }
+    }
+    
+    // ====== GOOGLE DRIVE PDF INGESTION ======
+    const PUBLIC_FOLDER_URL = "https://drive.google.com/drive/folders/1IdPSENw-efKI6S0QiMrSxk12YqxW3eRU";
+    
+    async function getFileIdsFromFolder(folderUrl) {
+      const res = await fetch(folderUrl);
+      const html = await res.text();
+      const regex = /https:\/\/drive\.google\.com\/file\/d\/([a-zA-Z0-9_-]+)\/view/g;
+      const ids = [];
+      let match;
+      while ((match = regex.exec(html)) !== null) {
+        ids.push(match[1]);
+      }
+      return ids;
+    }
+    
+    async function fetchPDFfromDrive(fileId) {
+      const url = `https://drive.google.com/uc?export=download&id=${fileId}`;
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`Failed to fetch PDF ${fileId}`);
+      const buffer = await res.arrayBuffer();
+      return Buffer.from(buffer);
+    }
+    
+    async function ingestCloudPDFs() {
+      const fileIds = await getFileIdsFromFolder(PUBLIC_FOLDER_URL);
+      console.log("Found PDF files:", fileIds.length);
+    
+      for (const fileId of fileIds) {
+        console.log("Processing file ID:", fileId);
+        const pdfBuffer = await fetchPDFfromDrive(fileId);
+        const pdfData = await pdfParse(pdfBuffer);
+        const chunks = chunkText(pdfData.text, 1200, 200);
+    
+        for (let i = 0; i < chunks.length; i++) {
+          const chunk = chunks[i];
+          const embedding = await createEmbedding(chunk);
+          const metadata = { source: fileId, chunk_index: i };
+          await upsertDocument(uuidv4(), chunk, metadata, embedding);
+        }
+      }
+    }
+    
+    // ====== RETRIEVAL ======
+    async function getTopKContexts(query, k = 5) {
+      const embResp = await openai.embeddings.create({ model: EMBEDDING_MODEL, input: query });
+      const queryEmbedding = embResp.data[0].embedding;
+    
+      const res = await pool.query(
+        `SELECT id, content, metadata, (embedding <-> $1) AS distance
+         FROM documents
+         ORDER BY embedding <-> $1
+         LIMIT $2`,
+        [queryEmbedding, k]
+      );
+      return res.rows;
+    }
+    
+    // ====== EXPRESS SERVER ======
+    const app = express();
+    app.use(express.json());
+    app.use(express.static(path.join(__dirname, "public")));
+    
+    app.post("/api/chat", async (req, res) => {
+      try {
+        const { query } = req.body;
+        if (!query) return res.status(400).json({ error: "query required" });
+    
+        const contexts = await getTopKContexts(query, 5);
+        let contextText = "";
+        for (const c of contexts) {
+          contextText += `---\nSource: ${c.metadata.source}\n${c.content}\n\n`;
+        }
+    
+        const messages = [
+          { role: "system", content: "You are a financial analyst using Berkshire Hathaway letters." },
+          { role: "user", content: `Documents:\n${contextText}\nQuestion: ${query}` }
+        ];
+    
+        const completion = await openai.chat.completions.create({
+          model: CHAT_MODEL,
+          messages,
+          max_tokens: 800,
+          temperature: 0
+        });
+    
+        const answer = completion.choices[0].message?.content || "";
+        res.json({ answer });
+      } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: "server error" });
+      }
+    });
+    
+    const port = 4111;
+    (async () => {
+      await ensureSchema();
+      console.log("Database ready ✅");
+      await ingestCloudPDFs();
+      console.log("Cloud PDFs ingested ✅");
+    
+      app.listen(port, () => console.log(`Server running at http://localhost:${port}`));
+    })();
+    
